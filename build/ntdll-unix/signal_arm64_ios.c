@@ -1313,6 +1313,38 @@ static int ios_mach_emulate_cas(uint32_t insn, uintptr_t rw_addr, uint64_t gpr[2
     return 1;
 }
 
+/* CASP/CASPA/CASPL/CASPAL pair forms (0sz0 1000 0L1 Rs o0 11111 Rn Rt), same
+ * contract as ios_mach_emulate_cas. FEX's unaligned-atomic helpers (DoCAS,
+ * RunCASPAL) issue a 128-bit CASPAL on guest memory from inside its exception
+ * handler. On an executable allocation that was just copied into the pool
+ * again, that access faults; delivered to the guest, it re-enters the same
+ * handler until the stack overflows. A hardware CASPAL on the RW alias keeps
+ * the operation atomic against other users of the alias. */
+static int ios_mach_emulate_casp(uint32_t insn, uintptr_t rw_addr, uint64_t gpr[29])
+{
+    unsigned rs = (insn >> 16) & 31, rt = insn & 31;
+    int wide = (insn >> 30) & 1;
+
+    if ((insn & 0xbfa07c00u) != 0x08207c00u) return 0;
+    if ((rs & 1) || (rt & 1) || rs + 1 >= 29 || rt + 1 >= 29) return 0;
+    if (!rw_addr || (rw_addr & (wide ? 15 : 7))) return 0;
+    {
+        register uint64_t c0 asm("x0") = gpr[rs];
+        register uint64_t c1 asm("x1") = gpr[rs + 1];
+        register uint64_t c2 asm("x2") = gpr[rt];
+        register uint64_t c3 asm("x3") = gpr[rt + 1];
+        if (wide)
+            asm volatile(".arch_extension lse\n\tcaspal x0, x1, x2, x3, [%4]"
+                         : "+r"(c0), "+r"(c1) : "r"(c2), "r"(c3), "r"(rw_addr) : "memory");
+        else
+            asm volatile(".arch_extension lse\n\tcaspal w0, w1, w2, w3, [%4]"
+                         : "+r"(c0), "+r"(c1) : "r"(c2), "r"(c3), "r"(rw_addr) : "memory");
+        gpr[rs] = c0;
+        gpr[rs + 1] = c1;
+    }
+    return 1;
+}
+
 /* ml938/ml939: defined far below, next to the store emulator they reuse.
  * Declared here because the Mach exception thread is the primary caller and
  * sits earlier in the file. */
@@ -3694,6 +3726,32 @@ static void *ios_mach_exception_thread( void *arg )
                                         insn, (unsigned long long)fault_pc,
                                         (unsigned long long)fault_addr,
                                         (unsigned long long)rw_addr, cas_width);
+                        }
+                    }
+                    /* CASPAL from FEX's unaligned-atomic helpers, on the pool or on
+                     * an executable allocation's alias. The whole aligned pair
+                     * must lie in one alias. */
+                    if (!emulated && (insn & 0xbfa07c00u) == 0x08207c00u)
+                    {
+                        unsigned rn = (insn >> 5) & 31;
+                        unsigned casp_width = (insn & 0x40000000u) ? 16 : 8;
+                        uint64_t base = rn == 31 ? state.__sp : rn == 30 ? state.__lr :
+                                        rn == 29 ? state.__fp : state.__x[rn];
+                        uintptr_t first = (uintptr_t)base, last = first + casp_width - 1;
+                        uintptr_t casp_rw = (rx && rw && first >= rx && first - rx < sz)
+                                            ? rw + (first - rx) : ios_jit_anon_alias_lookup( first );
+                        uintptr_t casp_rw_end = (rx && rw && last >= rx && last - rx < sz)
+                                                ? rw + (last - rx) : ios_jit_anon_alias_lookup( last );
+                        if (fault_addr >= first && fault_addr - first < casp_width && last > first &&
+                            casp_rw && casp_rw_end == casp_rw + casp_width - 1 &&
+                            ios_mach_emulate_casp(insn, casp_rw, state.__x))
+                        {
+                            static unsigned casp_mach_logs;
+                            emulated = 1;
+                            if (casp_mach_logs++ < 16)
+                                dprintf(STDERR_FILENO, "[mach-casp] insn=%08x pc=%llx addr=%llx rw=%llx\n",
+                                        insn, (unsigned long long)fault_pc,
+                                        (unsigned long long)first, (unsigned long long)casp_rw);
                         }
                     }
                     /* ml350 DISCRIMINATOR: alias EXISTS but the instruction is not
